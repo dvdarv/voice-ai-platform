@@ -14,10 +14,19 @@ class Agent(Base):
     
     # Agent configuration
     system_prompt = Column(Text, nullable=False)
-    voice = Column(String(50), default="alloy")
     greeting = Column(Text, nullable=True)  # Initial greeting message
+    
+    # LLM settings
     llm_provider = Column(String(50), default="openai")  # openai, anthropic, google
-    llm_model = Column(String(100), default="gpt-4-turbo")
+    llm_type = Column(String(50), default="realtime")  # realtime, chat
+    llm_model = Column(String(100), default="gpt-4o")
+    
+    # TTS (Text-to-Speech) settings
+    tts_provider = Column(String(50), default="openai")  # openai, elevenlabs, deepgram, cartesia
+    tts_voice = Column(String(100), default="alloy")  # Voice ID or name
+    
+    # STT (Speech-to-Text) settings
+    stt_provider = Column(String(50), default="openai")  # openai, deepgram
     
     # Voice/Speech settings
     temperature = Column(Float, default=0.8)  # LLM temperature (0-2)

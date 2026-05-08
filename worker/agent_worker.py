@@ -1,25 +1,48 @@
 import os
 import sys
-import asyncio
 from dotenv import load_dotenv
 from livekit import agents
 from livekit.agents import AgentServer, AgentSession, Agent
-from livekit.plugins import openai
 
-# Try to import ElevenLabs plugin
+# Import all plugins
+from livekit.plugins import openai as openai_plugin
+
+# Try to import additional TTS/STT providers
 try:
-    from livekit.plugins import elevenlabs as elevenlabs_plugin
+    from livekit.plugins import elevenlabs
     ELEVENLABS_AVAILABLE = True
     print("[WORKER] ElevenLabs plugin available", flush=True)
 except ImportError:
     ELEVENLABS_AVAILABLE = False
-    print("[WORKER] ElevenLabs plugin not available", flush=True)
+    print("[WORKER] ElevenLabs plugin NOT available", flush=True)
+
+try:
+    from livekit.plugins import deepgram
+    DEEPGRAM_AVAILABLE = True
+    print("[WORKER] Deepgram plugin available", flush=True)
+except ImportError:
+    DEEPGRAM_AVAILABLE = False
+    print("[WORKER] Deepgram plugin NOT available", flush=True)
+
+try:
+    from livekit.plugins import google
+    GOOGLE_AVAILABLE = True
+    print("[WORKER] Google plugin available", flush=True)
+except ImportError:
+    GOOGLE_AVAILABLE = False
+    print("[WORKER] Google plugin NOT available", flush=True)
+
+try:
+    from livekit.plugins import cartesia
+    CARTESIA_AVAILABLE = True
+    print("[WORKER] Cartesia plugin available", flush=True)
+except ImportError:
+    CARTESIA_AVAILABLE = False
+    print("[WORKER] Cartesia plugin NOT available", flush=True)
 
 # Database imports
 try:
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-    from sqlalchemy import Column, String, Text
-    from sqlalchemy.orm import declarative_base
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
@@ -28,135 +51,159 @@ except ImportError:
 load_dotenv()
 
 AGENT_NAME = os.getenv("AGENT_NAME", "voice-agent")
-VOICE = os.getenv("AGENT_VOICE", "alloy")
-DEFAULT_PROMPT = os.getenv("AGENT_SYSTEM_PROMPT", "You are a helpful AI voice assistant. Be friendly and concise.")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-
-# Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
 
 print(f"[WORKER] Starting with AGENT_NAME={AGENT_NAME}", flush=True)
 
+# Database setup
+async_session_maker = None
 if DB_AVAILABLE and DATABASE_URL:
-    # Convert postgresql:// to postgresql+asyncpg://
     if DATABASE_URL.startswith("postgresql://"):
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
-    
-    # Remove sslmode=require from URL (asyncpg handles SSL differently)
     DATABASE_URL = DATABASE_URL.split("?")[0]
     
     print(f"[WORKER] Database configured: {DATABASE_URL[:50]}...", flush=True)
     
     engine = create_async_engine(DATABASE_URL, echo=False)
     async_session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+def create_tts(tts_provider: str, tts_voice: str):
+    """Create TTS instance based on provider"""
+    provider = tts_provider.lower() if tts_provider else "openai"
+    voice = tts_voice or "alloy"
     
-    Base = declarative_base()
+    if provider == "openai":
+        return openai_plugin.TTS(voice=voice)
     
-    class AgentModel(Base):
-        __tablename__ = "agents"
-        id = Column(String(36), primary_key=True)
-        name = Column(String(255), nullable=False)
-        system_prompt = Column(Text, nullable=False)
-        voice = Column(String(255), default="alloy")  # Extended to support longer voice IDs
-        llm_provider = Column(String(50), default="openai")  # openai, anthropic, google, elevenlabs
-        llm_model = Column(String(100), default="gpt-4-turbo")
-        
-else:
-    print("[WORKER] Using default prompt (no database)", flush=True)
+    elif provider == "elevenlabs":
+        if not ELEVENLABS_AVAILABLE:
+            print("[WORKER] ElevenLabs not available, falling back to OpenAI", flush=True)
+            return openai_plugin.TTS(voice="alloy")
+        voice_id = voice.replace("elevenlabs:", "").replace("elevenlabs_", "")
+        return elevenlabs.TTS(voice_id=voice_id)
+    
+    elif provider == "deepgram":
+        if not DEEPGRAM_AVAILABLE:
+            print("[WORKER] Deepgram not available, falling back to OpenAI", flush=True)
+            return openai_plugin.TTS(voice="alloy")
+        return deepgram.TTS(model="nova-2", voice=voice)
+    
+    elif provider == "cartesia":
+        if not CARTESIA_AVAILABLE:
+            print("[WORKER] Cartesia not available, falling back to OpenAI", flush=True)
+            return openai_plugin.TTS(voice="alloy")
+        voice_id = voice.replace("cartesia:", "").replace("cartesia_", "")
+        return cartesia.TTS(voice_id=voice_id)
+    
+    else:
+        print(f"[WORKER] Unknown TTS provider: {provider}, using OpenAI", flush=True)
+        return openai_plugin.TTS(voice="alloy")
 
 
-def is_elevenlabs_voice(voice: str) -> bool:
-    """Check if the voice is an ElevenLabs voice"""
-    if not voice:
-        return False
-    # ElevenLabs voice IDs are typically long alphanumeric strings (UUIDs)
-    # They don't match standard OpenAI voice names
-    openai_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-    if voice.lower() in openai_voices:
-        return False
-    # If it's not a standard OpenAI voice, check if it's a valid ElevenLabs voice ID
-    # ElevenLabs IDs are typically 36 characters (UUID format) or longer
-    if len(voice) >= 20 and not voice.startswith("elevenlabs:"):
-        return True  # Likely an ElevenLabs voice ID
-    return voice.startswith("elevenlabs:") or voice.startswith("elevenlabs_")
+def create_stt(stt_provider: str):
+    """Create STT instance based on provider"""
+    provider = stt_provider.lower() if stt_provider else "openai"
+    
+    if provider == "openai":
+        # OpenAI RealtimeModel handles STT automatically
+        return None
+    
+    elif provider == "deepgram":
+        if not DEEPGRAM_AVAILABLE:
+            print("[WORKER] Deepgram not available, using OpenAI STT", flush=True)
+            return None
+        return deepgram.STT(model="nova-2")
+    
+    else:
+        print(f"[WORKER] Unknown STT provider: {provider}, using OpenAI", flush=True)
+        return None
 
 
-def is_elevenlabs_provider(llm_provider: str) -> bool:
-    """Check if the LLM provider indicates ElevenLabs voice"""
-    if not llm_provider:
-        return False
-    return llm_provider.lower() in ["elevenlabs", "11labs"]
+def create_llm(llm_provider: str, llm_type: str, llm_model: str):
+    """Create LLM instance based on provider and type"""
+    provider = llm_provider.lower() if llm_provider else "openai"
+    llm_type = llm_type.lower() if llm_type else "realtime"
+    model = llm_model or "gpt-4o"
+    
+    if provider == "openai":
+        if llm_type == "realtime":
+            return openai_plugin.realtime.RealtimeModel(model="gpt-4o-realtime-preview-2024-12-01")
+        else:
+            return openai_plugin.LLM(model=model)
+    
+    elif provider in ["google", "gemini"]:
+        if not GOOGLE_AVAILABLE:
+            print("[WORKER] Google not available, falling back to OpenAI", flush=True)
+            return openai_plugin.realtime.RealtimeModel()
+        if llm_type == "realtime":
+            return google.realtime.RealtimeModel(model="gemini-2.0-flash-exp")
+        else:
+            return google.LLM(model="gemini-2.0-flash")
+    
+    elif provider == "anthropic":
+        from livekit.plugins import anthropic
+        return anthropic.LLM(model=model or "claude-3-5-sonnet-20241022")
+    
+    else:
+        print(f"[WORKER] Unknown LLM provider: {provider}, using OpenAI", flush=True)
+        return openai_plugin.realtime.RealtimeModel()
 
 
 async def get_agent_config(agent_name: str) -> dict:
     """Get agent configuration from database"""
-    if not DB_AVAILABLE or not DATABASE_URL:
-        print(f"[WORKER] DB not available, using default prompt", flush=True)
-        return {
-            "system_prompt": DEFAULT_PROMPT,
-            "voice": VOICE,
-            "llm_model": "gpt-4-turbo"
-        }
+    defaults = {
+        "system_prompt": "You are a helpful AI voice assistant.",
+        "llm_provider": "openai",
+        "llm_type": "realtime",
+        "llm_model": "gpt-4o",
+        "tts_provider": "openai",
+        "tts_voice": "alloy",
+        "stt_provider": "openai",
+        "greeting": None
+    }
+    
+    if not DB_AVAILABLE or not async_session_maker:
+        print("[WORKER] DB not available, using defaults", flush=True)
+        return defaults
     
     try:
         async with async_session_maker() as session:
             from sqlalchemy import text
-            query = text(f"SELECT system_prompt, voice, llm_provider, llm_model FROM agents WHERE name = :name AND is_active = true")
+            query = text("""
+                SELECT system_prompt, llm_provider, llm_type, llm_model, 
+                       tts_provider, tts_voice, stt_provider, greeting
+                FROM agents 
+                WHERE name = :name AND is_active = true
+            """)
             result = await session.execute(query, {"name": agent_name})
             row = result.fetchone()
             
             if row:
-                voice_id = row[1] or VOICE
-                llm_provider = row[2]
-                # Check both provider type and voice ID for ElevenLabs
-                is_eleven = is_elevenlabs_provider(llm_provider) or is_elevenlabs_voice(voice_id)
                 print(f"[WORKER] Found agent '{agent_name}' in DB!", flush=True)
-                print(f"[WORKER] Voice: {voice_id}, Provider: {llm_provider}, Is ElevenLabs: {is_eleven}", flush=True)
-                return {
-                    "system_prompt": row[0] or DEFAULT_PROMPT,
-                    "voice": voice_id,
-                    "llm_provider": llm_provider,
-                    "llm_model": row[3] or "gpt-4-turbo",
-                    "is_elevenlabs": is_eleven
+                config = {
+                    "system_prompt": row[0],
+                    "llm_provider": row[1] or defaults["llm_provider"],
+                    "llm_type": row[2] or defaults["llm_type"],
+                    "llm_model": row[3] or defaults["llm_model"],
+                    "tts_provider": row[4] or defaults["tts_provider"],
+                    "tts_voice": row[5] or defaults["tts_voice"],
+                    "stt_provider": row[6] or defaults["stt_provider"],
+                    "greeting": row[7]
                 }
+                print(f"[WORKER] LLM: {config['llm_provider']}/{config['llm_type']}", flush=True)
+                print(f"[WORKER] TTS: {config['tts_provider']}/{config['tts_voice']}", flush=True)
+                print(f"[WORKER] STT: {config['stt_provider']}", flush=True)
+                return config
             else:
-                print(f"[WORKER] Agent '{agent_name}' NOT FOUND in DB, using default", flush=True)
-                print(f"[WORKER] Available agents in DB:", flush=True)
-                result2 = await session.execute(text("SELECT name FROM agents"))
-                for r in result2:
-                    print(f"  - {r[0]}", flush=True)
-                return {
-                    "system_prompt": DEFAULT_PROMPT,
-                    "voice": VOICE,
-                    "llm_model": "gpt-4-turbo",
-                    "is_elevenlabs": False
-                }
+                print(f"[WORKER] Agent '{agent_name}' NOT FOUND, using defaults", flush=True)
+                return defaults
     except Exception as e:
         print(f"[WORKER] Error fetching agent config: {e}", flush=True)
-        return {
-            "system_prompt": DEFAULT_PROMPT,
-            "voice": VOICE,
-            "llm_model": "gpt-4-turbo",
-            "is_elevenlabs": False
-        }
+        return defaults
 
 
-def create_realtime_model(voice: str, is_elevenlabs: bool):
-    """Create the appropriate realtime model based on voice type"""
-    if is_elevenlabs and ELEVENLABS_AVAILABLE and ELEVENLABS_API_KEY:
-        # Clean the voice ID (remove prefix if present)
-        voice_id = voice.replace("elevenlabs:", "").replace("elevenlabs_", "")
-        print(f"[WORKER] Creating ElevenLabs RealtimeModel with voice: {voice_id}", flush=True)
-        return openai.realtime.RealtimeModel(
-            voice="elevenlabs",
-            model="elevenlabs/eleven_turbo_2"
-        )
-    else:
-        # Use standard OpenAI voice
-        print(f"[WORKER] Creating OpenAI RealtimeModel with voice: {voice}", flush=True)
-        return openai.realtime.RealtimeModel(voice=voice)
-
-
+# Create AgentServer
 server = AgentServer()
 
 
@@ -164,48 +211,53 @@ server = AgentServer()
 async def voice_agent(ctx: agents.JobContext):
     print(f"[VOICE_AGENT] Session started!", flush=True)
     print(f"[VOICE_AGENT] Room: {ctx.room.name}", flush=True)
-    print(f"[VOICE_AGENT] Job ID: {ctx.job.id}", flush=True)
     
     try:
-        # Get agent config from database
-        agent_config = await get_agent_config(AGENT_NAME)
+        # Get config from database
+        config = await get_agent_config(AGENT_NAME)
         print(f"[VOICE_AGENT] Loaded config for agent: {AGENT_NAME}", flush=True)
-        print(f"[VOICE_AGENT] System prompt: {agent_config['system_prompt'][:50]}...", flush=True)
-        print(f"[VOICE_AGENT] Voice: {agent_config['voice']}", flush=True)
-        print(f"[VOICE_AGENT] Is ElevenLabs: {agent_config.get('is_elevenlabs', False)}", flush=True)
         
-        # Connect to the room first
-        print(f"[VOICE_AGENT] Connecting to room...", flush=True)
+        # Connect to room
         await ctx.connect()
         print(f"[VOICE_AGENT] Connected to room", flush=True)
         
-        # Create agent with dynamic config
+        # Create LLM
+        print(f"[VOICE_AGENT] Creating LLM...", flush=True)
+        llm = create_llm(config["llm_provider"], config["llm_type"], config["llm_model"])
+        
+        # Create TTS
+        print(f"[VOICE_AGENT] Creating TTS ({config['tts_provider']})...", flush=True)
+        tts = create_tts(config["tts_provider"], config["tts_voice"])
+        
+        # Create STT (optional)
+        stt = create_stt(config["stt_provider"])
+        
+        # Create session
+        print(f"[VOICE_AGENT] Creating AgentSession...", flush=True)
+        session_kwargs = {"llm": llm, "tts": tts}
+        if stt:
+            session_kwargs["stt"] = stt
+        
+        session = AgentSession(**session_kwargs)
+        
+        # Create agent
         class DynamicAgent(Agent):
             def __init__(self, instructions: str) -> None:
                 super().__init__(instructions=instructions)
         
-        # Create realtime model with configured voice
-        print(f"[VOICE_AGENT] Creating RealtimeModel...", flush=True)
-        llm = create_realtime_model(
-            agent_config["voice"],
-            agent_config.get("is_elevenlabs", False)
-        )
-        print(f"[VOICE_AGENT] RealtimeModel created successfully", flush=True)
-        
-        session = AgentSession(llm=llm)
-        print(f"[VOICE_AGENT] AgentSession created", flush=True)
-
-        # Start the session
+        # Start session
         print(f"[VOICE_AGENT] Starting session...", flush=True)
-        await session.start(room=ctx.room, agent=DynamicAgent(agent_config["system_prompt"]))
-        print(f"[VOICE_AGENT] Session started!", flush=True)
-
+        await session.start(room=ctx.room, agent=DynamicAgent(config["system_prompt"]))
+        
         # Generate greeting
-        print(f"[VOICE_AGENT] Generating reply...", flush=True)
-        await session.generate_reply(
-            instructions="Greet the user and offer your assistance."
-        )
-        print(f"[VOICE_AGENT] Reply sent!", flush=True)
+        if config.get("greeting"):
+            print(f"[VOICE_AGENT] Using configured greeting...", flush=True)
+            await session.generate_reply(instructions=config["greeting"])
+        else:
+            print(f"[VOICE_AGENT] Generating default greeting...", flush=True)
+            await session.generate_reply(instructions="Greet the user and offer your assistance.")
+        
+        print(f"[VOICE_AGENT] Ready!", flush=True)
         
     except Exception as e:
         print(f"[VOICE_AGENT] ERROR: {e}", flush=True)
@@ -214,6 +266,6 @@ async def voice_agent(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
-    print(f"[WORKER] Starting voice-agent with name: {AGENT_NAME}", flush=True)
-    print(f"[WORKER] ElevenLabs available: {ELEVENLABS_AVAILABLE}", flush=True)
+    print(f"[WORKER] Starting voice-agent: {AGENT_NAME}", flush=True)
+    print(f"[WORKER] Plugins - ElevenLabs: {ELEVENLABS_AVAILABLE}, Deepgram: {DEEPGRAM_AVAILABLE}, Google: {GOOGLE_AVAILABLE}", flush=True)
     agents.cli.run_app(server)
