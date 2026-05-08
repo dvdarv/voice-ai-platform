@@ -64,6 +64,15 @@ class AgentUpdate(BaseModel):
     
     # Voice Configuration
     voice: Optional[str] = None
+    greeting: Optional[str] = None
+    
+    # LLM Configuration
+    llm_type: Optional[str] = None
+    
+    # TTS/STT Configuration
+    tts_provider: Optional[str] = None
+    tts_voice: Optional[str] = None
+    stt_provider: Optional[str] = None
     
     # Turn Detection
     turn_detection: Optional[str] = None
